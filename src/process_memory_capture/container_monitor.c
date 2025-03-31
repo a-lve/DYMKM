@@ -1,194 +1,220 @@
-#include <linux/module.h>
-#include <linux/kprobes.h>
-#include <linux/version.h>
-#include <linux/cred.h>
-#include <linux/sched.h>
-#include <linux/crypto.h>
-#include <linux/fs.h>
-#include <crypto/hash.h>
-#include <linux/uaccess.h>  // 新增用户空间访问头文件
-#include <linux/vmalloc.h>
-
-#define TASK_COMM_LEN 16
-#define HASH_BUF_SIZE 1024
-#define SHA256_DIGEST_SIZE 32
-
-static struct kprobe docker_kp;
-
-// 完整性度量结构体
-struct container_event {
-    char event_type[20];
-    char container_id[64];
-    char image_hash[65];      // 调整为64字节+1结束符
-    char parent_comm[TASK_COMM_LEN];
-};
-
-struct sdesc {
-    struct shash_desc shash;
-    char ctx[];
-};
-
-// 安全获取容器ID函数（新增）
-static int safe_get_container_id(char *buf, int size) 
+static asmlinkage long my_execve(const struct pt_regs *regs)
 {
-    struct mm_struct *mm = current->mm;
-    unsigned long env_start = mm->env_start;
-    unsigned long env_end = mm->env_end;
-    char tmp[64] = {0};
-    int ret = -ENOENT;
+    char __user *filename = (char *)regs->di;
+    char user_filename[MAX_FILE_NAME_LEN] = {0};
+    int len = 0, flag = 1;
+    long copied = 0;
+    char **argv = (char **)regs->si;
+    int i = 0, j = 0;
+    char file[BUF_SIZE] = {'\0'};
+    char *image_names = NULL;
+    char cmp_str[image_name_size] = {'\0'};
+    char dirn[PATH_LEN] = {'\0'};
+    int num = 0;
 
-    // 使用访问用户空间的安全函数
-    if (env_start >= env_end)
-        return ret;
+    mm_segment_t fs;
+    loff_t pos;
+    struct file *fp;
+    int fsize;
+    int kernel_read_num;
+    char single_image[image_name_size] = {'\0'};
+    char new_name[image_name_size] = {'\0'};
+    int image_flag;
+    int flag_vtpm = 0;
 
-    long env_len = env_end - env_start;
-    char *env = vmalloc(env_len);
-    if (!env)
-        return -ENOMEM;
+    copied = strncpy_from_user(user_filename, filename, len);
 
-    if (copy_from_user(env, (const char __user *)env_start, env_len)) {
-        vfree(env);
-        return -EFAULT;
+    strncpy(file, Project_path, BUF_SIZE);
+    strcat(file, "images.log");
+
+    len = strnlen_user(filename, MAX_FILE_NAME_LEN);
+    if (unlikely(len >= MAX_FILE_NAME_LEN))
+    {
+        len = MAX_FILE_NAME_LEN - 1;
     }
 
-    char *cur = env;
-    while (cur < env + env_len) {
-        if (strncmp(cur, "CONTAINER_ID=", 13) == 0) {
-            strscpy(tmp, cur + 13, sizeof(tmp));
-            ret = 0;
-            break;
+    get_user_cmdline(argv, user_filename, MAX_FILE_NAME_LEN);
+
+    if (strstr(user_filename, "docker pull"))
+    {
+        if (strstr(user_filename, "logger"))
+        {
+            docker_images(file);
+
+            fp = filp_open(file, O_RDONLY, 0);
+            if (IS_ERR(fp))
+            {
+                printk("create file error/n");
+                return -1;
+            }
+
+            fsize = fp->f_inode->i_size;
+            fs = get_fs();
+            set_fs(KERNEL_DS);
+            pos = 0;
+
+            image_names = (char *)kmalloc(fsize, GFP_KERNEL);
+            kernel_read_num = kernel_read(fp, image_names, BUF_SIZE, &pos);
+
+            for (i = 0; i < kernel_read_num; i++)
+            {
+                if (image_names[i] != '\n')
+                {
+                    single_image[j] = image_names[i];
+                    j++;
+                    continue;
+                }
+
+                strcpy(new_name, single_image);
+                name_change(new_name);
+                image_flag = file_exist(Base_value_path, new_name);
+
+                if (image_flag == 0 && (strstr(user_filename, single_image) != NULL))
+                {
+                    query_loc(Base_value_path, single_image, new_name);
+                    base_generate(Base_value_path, new_name);
+                }
+
+                memset(single_image, 0x00, sizeof(single_image));
+                memset(new_name, 0x00, sizeof(single_image));
+                j = 0;
+            }
+
+            filp_close(fp, NULL);
+            set_fs(fs);
+
+            kfree(image_names);
+            image_names = NULL;
+            printk("Complete the base value calculation!");
+            printk("OK!");
         }
-        cur += strlen(cur) + 1;
     }
 
-    if (!ret)
-        strscpy(buf, tmp, size);
+    if (strstr(user_filename, "docker run") || strstr(user_filename, "docker create"))
+    {
+        if (!strstr(user_filename, "logger"))
+        {
+            parse(cmp_str, image_record_path, user_filename);
 
-    vfree(env);
-    return ret;
-}
+            if (strcmp(cmp_str, "none") != 0)
+            {
+                flag = measure(Project_path, Base_value_path, cmp_str);
 
-// 计算文件SHA256哈希（关键修改）
-static void calculate_hash(const char *path, char *output) 
-{
-    struct file *file = NULL;
-    char buf[HASH_BUF_SIZE] __aligned(8); // 确保内存对齐
-    loff_t pos = 0;
-    struct crypto_shash *tfm = NULL;
-    struct sdesc *desc = NULL;
-    int ret = 0;
-
-    file = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR(file)) {
-        strscpy(output, "file_err", SHA256_DIGEST_SIZE);
-        return;
-    }
-
-    tfm = crypto_alloc_shash("sha256", 0, 0);
-    if (IS_ERR(tfm)) {
-        ret = PTR_ERR(tfm);
-        goto cleanup_file;
-    }
-
-    int desc_size = sizeof(struct shash_desc) + crypto_shash_descsize(tfm);
-    desc = kzalloc(desc_size, GFP_KERNEL);
-    if (!desc) {
-        ret = -ENOMEM;
-        goto cleanup_tfm;
-    }
-    desc->shash.tfm = tfm;
-
-    ret = crypto_shash_init(&desc->shash);
-    if (ret)
-        goto cleanup_desc;
-
-    ssize_t read_size;
-    while ((read_size = kernel_read(file, buf, HASH_BUF_SIZE, &pos)) > 0) {
-        ret = crypto_shash_update(&desc->shash, buf, read_size);
-        if (ret)
-            goto cleanup_desc;
-        memset(buf, 0, HASH_BUF_SIZE);
-    }
-
-    if (read_size < 0) {  // 处理读取错误
-        ret = read_size;
-        goto cleanup_desc;
-    }
-
-    ret = crypto_shash_final(&desc->shash, output);
-    if (ret)
-        goto cleanup_desc;
-
-cleanup_desc:
-    kfree(desc);
-cleanup_tfm:
-    crypto_free_shash(tfm);
-cleanup_file:
-    filp_close(file, NULL);
-    
-    if (ret)
-        snprintf(output, SHA256_DIGEST_SIZE, "hash_err%d", abs(ret));
-}
-
-// 监控处理函数（关键修改）
-static int handler_pre(struct kprobe *p, struct pt_regs *regs) 
-{
-    struct task_struct *parent = current->real_parent;
-    struct container_event event = {};  // 显式初始化
-    char parent_comm[TASK_COMM_LEN] = {0};
-    
-    get_task_comm(parent_comm, parent);
-
-    if (strncmp(parent_comm, "dockerd", TASK_COMM_LEN) == 0 ||
-        strncmp(parent_comm, "containerd", TASK_COMM_LEN) == 0) {
-        
-        // 使用安全方法获取容器ID
-        if (safe_get_container_id(event.container_id, sizeof(event.container_id))) {
-            strscpy(event.container_id, "unknown", sizeof(event.container_id));
+                if (flag == 1)
+                {
+                    printk("measure complete,It's ok! Create a new secure container ^_^ !");
+                    printString("Measure OK !\n");
+                    return old_execve(regs);
+                }
+                else if (flag == -2)
+                {
+                    printk("measure complete,It's wrong! Can't crate a new secure container!");
+                    printString("The base value is attacked.\n");
+                    return -1;
+                }
+                else
+                {
+                    printk("measure complete,It's wrong! Can't crate a new secure container! ");
+                    printString("Measure error, images may have been attacked.\n");
+                    return -1;
+                }
+            }
+            else
+            {
+                printString("Please use docker pull to download the image firstly.");
+                return -1;
+            }
         }
-
-        strscpy(event.event_type, "container_start", sizeof(event.event_type));
-        strscpy(event.parent_comm, parent_comm, sizeof(event.parent_comm));
-        
-        char image_path[256];
-        snprintf(image_path, sizeof(image_path), 
-                "/var/lib/docker/containers/%s/config.v2.json", 
-                event.container_id);
-        
-        calculate_hash(image_path, event.image_hash);
-        
-        printk(KERN_INFO "[Container Monitor] Event: %s | Container: %s | Image Hash: %64phN\n",
-               event.event_type, event.container_id, event.image_hash);
     }
-    return 0;
-}
 
-static int __init monitor_init(void) 
-{
-    // 使用正确的系统调用符号（根据内核版本调整）
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,11,0)
-    docker_kp.symbol_name = "__x64_sys_execve";
-#else
-    docker_kp.symbol_name = "sys_execve";
-#endif
+    if (strstr(user_filename, "/var/run/docker/runtime-runc/moby"))
+    {
+        if (strstr(user_filename, "start"))
+        {
+            j = 0;
+            for (i = 0; i < strlen(user_filename); i++)
+            {
+                if (user_filename[i] == ' ' && user_filename[i - 1] == 'g' && user_filename[i - 2] == 'o' && user_filename[i - 3] == 'l' && user_filename[i - 4] == '-')
+                {
+                    num = 1;
+                }
+                if (num == 1 && (user_filename[i + 1] != ' '))
+                {
+                    dirn[j] = user_filename[i + 1];
+                    j++;
+                }
+                if (user_filename[i + 1] == ' ')
+                {
+                    num = 0;
+                }
+            }
+            if (j == 0)
+            {
+                printk(KERN_DEBUG "create vtpm error!");
+                return -1;
+            }
+            flag_vtpm = end_replace(dirn, "/config.json");
+            if (flag_vtpm == -1)
+            {
+                printk(KERN_DEBUG "create vtpm error!");
+                return -1;
+            }
 
-    docker_kp.pre_handler = handler_pre;
-    
-    int ret = register_kprobe(&docker_kp);
-    if (ret) {
-        printk(KERN_ERR "Failed to register kprobe: %d\n", ret);
-        return ret;
+            // 使用内核哈希算法替代TPM加密
+            char hash[SHA256_DIGEST_SIZE] = {0};
+            struct crypto_shash *tfm;
+            struct shash_desc *desc;
+            int ret;
+
+            tfm = crypto_alloc_shash("sha256", 0, 0);
+            if (IS_ERR(tfm)) {
+                printk(KERN_ERR "Failed to allocate SHA-256 algorithm\n");
+                return -1;
+            }
+
+            desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+            if (!desc) {
+                crypto_free_shash(tfm);
+                printk(KERN_ERR "Failed to allocate memory for shash_desc\n");
+                return -1;
+            }
+
+            desc->tfm = tfm;
+
+            ret = crypto_shash_digest(desc, dirn, strlen(dirn), hash);
+            if (ret) {
+                printk(KERN_ERR "Failed to compute SHA-256 hash\n");
+                kfree(desc);
+                crypto_free_shash(tfm);
+                return -1;
+            }
+
+            kfree(desc);
+            crypto_free_shash(tfm);
+
+            // 将哈希值存储到文件中
+            char hash_file[BUF_SIZE] = {'\0'};
+            strncpy(hash_file, dirn, strlen(dirn));
+            strcat(hash_file, "/hash.txt");
+
+            struct file *f;
+            mm_segment_t old_fs = get_fs();
+            set_fs(KERNEL_DS);
+            f = filp_open(hash_file, O_CREAT | O_WRONLY, 0644);
+            if (IS_ERR(f)) {
+                printk(KERN_ERR "Failed to open file for writing hash\n");
+                set_fs(old_fs);
+                return -1;
+            }
+
+            loff_t pos = 0;
+            kernel_write(f, hash, SHA256_DIGEST_SIZE, &pos);
+            filp_close(f, NULL);
+            set_fs(old_fs);
+
+            printk(KERN_INFO "SHA-256 hash computed and stored successfully\n");
+        }
     }
-    printk(KERN_INFO "Container Monitor loaded\n");
-    return 0;
-}
 
-static void __exit monitor_exit(void) 
-{
-    unregister_kprobe(&docker_kp);
-    printk(KERN_INFO "Container Monitor unloaded\n");
+    return old_execve(regs);
 }
-
-module_init(monitor_init);
-module_exit(monitor_exit);
-MODULE_LICENSE("GPL");
