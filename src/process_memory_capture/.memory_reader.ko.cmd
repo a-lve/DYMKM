@@ -1,0 +1,1 @@
+cmd_/home/lll/mount/DYMKM/src/process_memory_capture/memory_reader.ko := ld -r  -m elf_x86_64 -z noexecstack   --build-id=sha1  -T scripts/module.lds -o /home/lll/mount/DYMKM/src/process_memory_capture/memory_reader.ko /home/lll/mount/DYMKM/src/process_memory_capture/memory_reader.o /home/lll/mount/DYMKM/src/process_memory_capture/memory_reader.mod.o;  true

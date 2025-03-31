@@ -1,0 +1,1 @@
+cmd_/home/lll/mount/DYMKM/src/process_memory_capture/Module.symvers := sed 's/\.ko$$/\.o/' /home/lll/mount/DYMKM/src/process_memory_capture/modules.order | scripts/mod/modpost -m -a  -o /home/lll/mount/DYMKM/src/process_memory_capture/Module.symvers -e -i Module.symvers   -T -

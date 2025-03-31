@@ -1,0 +1,1 @@
+cmd_/home/lll/mount/DYMKM/src/process_memory_capture/container_monitor.ko := ld -r  -m elf_x86_64 -z noexecstack   --build-id=sha1  -T scripts/module.lds -o /home/lll/mount/DYMKM/src/process_memory_capture/container_monitor.ko /home/lll/mount/DYMKM/src/process_memory_capture/container_monitor.o /home/lll/mount/DYMKM/src/process_memory_capture/container_monitor.mod.o;  true

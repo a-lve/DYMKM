@@ -5,12 +5,13 @@
 #include <linux/sched.h>
 #include <linux/crypto.h>
 #include <linux/fs.h>
-#include <linux/crypto.h>      // 新增
-#include <crypto/hash.h>       // 新增
-#include <crypto/sha.h>        // 新增
+#include <crypto/hash.h>
+#include <linux/uaccess.h>  // 新增用户空间访问头文件
+#include <linux/vmalloc.h>
 
 #define TASK_COMM_LEN 16
 #define HASH_BUF_SIZE 1024
+#define SHA256_DIGEST_SIZE 32
 
 static struct kprobe docker_kp;
 
@@ -18,42 +19,79 @@ static struct kprobe docker_kp;
 struct container_event {
     char event_type[20];
     char container_id[64];
-    char image_hash[65];
+    char image_hash[65];      // 调整为64字节+1结束符
     char parent_comm[TASK_COMM_LEN];
 };
 
-struct sdesc {                 // 新增包装结构体
+struct sdesc {
     struct shash_desc shash;
     char ctx[];
 };
 
+// 安全获取容器ID函数（新增）
+static int safe_get_container_id(char *buf, int size) 
+{
+    struct mm_struct *mm = current->mm;
+    unsigned long env_start = mm->env_start;
+    unsigned long env_end = mm->env_end;
+    char tmp[64] = {0};
+    int ret = -ENOENT;
 
-// 计算文件SHA256哈希
-static void calculate_hash(const char *path, char *output) {
+    // 使用访问用户空间的安全函数
+    if (env_start >= env_end)
+        return ret;
+
+    long env_len = env_end - env_start;
+    char *env = vmalloc(env_len);
+    if (!env)
+        return -ENOMEM;
+
+    if (copy_from_user(env, (const char __user *)env_start, env_len)) {
+        vfree(env);
+        return -EFAULT;
+    }
+
+    char *cur = env;
+    while (cur < env + env_len) {
+        if (strncmp(cur, "CONTAINER_ID=", 13) == 0) {
+            strscpy(tmp, cur + 13, sizeof(tmp));
+            ret = 0;
+            break;
+        }
+        cur += strlen(cur) + 1;
+    }
+
+    if (!ret)
+        strscpy(buf, tmp, size);
+
+    vfree(env);
+    return ret;
+}
+
+// 计算文件SHA256哈希（关键修改）
+static void calculate_hash(const char *path, char *output) 
+{
     struct file *file = NULL;
-    char buf[HASH_BUF_SIZE] = {0};
+    char buf[HASH_BUF_SIZE] __aligned(8); // 确保内存对齐
     loff_t pos = 0;
     struct crypto_shash *tfm = NULL;
     struct sdesc *desc = NULL;
     int ret = 0;
-    
-    // 文件操作
+
     file = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(file)) {
-        snprintf(output, SHA256_DIGEST_SIZE, "file_err");
+        strscpy(output, "file_err", SHA256_DIGEST_SIZE);
         return;
     }
 
-    // 分配哈希算法（参考网页58）
     tfm = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(tfm)) {
         ret = PTR_ERR(tfm);
         goto cleanup_file;
     }
 
-    // 分配描述符内存（含算法上下文空间）
     int desc_size = sizeof(struct shash_desc) + crypto_shash_descsize(tfm);
-    desc = kmalloc(desc_size, GFP_KERNEL);
+    desc = kzalloc(desc_size, GFP_KERNEL);
     if (!desc) {
         ret = -ENOMEM;
         goto cleanup_tfm;
@@ -64,19 +102,19 @@ static void calculate_hash(const char *path, char *output) {
     if (ret)
         goto cleanup_desc;
 
-    // 分块计算哈希
-    while ((ret = kernel_read(file, buf, HASH_BUF_SIZE, &pos)) > 0) {
-        ret = crypto_shash_update(&desc->shash, buf, ret);
+    ssize_t read_size;
+    while ((read_size = kernel_read(file, buf, HASH_BUF_SIZE, &pos)) > 0) {
+        ret = crypto_shash_update(&desc->shash, buf, read_size);
         if (ret)
             goto cleanup_desc;
-        memset(buf, 0, HASH_BUF_SIZE); // 清空缓冲区防止信息泄漏
+        memset(buf, 0, HASH_BUF_SIZE);
     }
 
-    // 处理读取错误
-    if (ret < 0)
+    if (read_size < 0) {  // 处理读取错误
+        ret = read_size;
         goto cleanup_desc;
+    }
 
-    // 最终哈希计算
     ret = crypto_shash_final(&desc->shash, output);
     if (ret)
         goto cleanup_desc;
@@ -88,63 +126,65 @@ cleanup_tfm:
 cleanup_file:
     filp_close(file, NULL);
     
-    // 错误处理
-    if (ret) {
+    if (ret)
         snprintf(output, SHA256_DIGEST_SIZE, "hash_err%d", abs(ret));
-    }
 }
 
-// 监控处理函数
-static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
+// 监控处理函数（关键修改）
+static int handler_pre(struct kprobe *p, struct pt_regs *regs) 
+{
     struct task_struct *parent = current->real_parent;
-    struct container_event event;
-    char parent_comm[TASK_COMM_LEN];
+    struct container_event event = {};  // 显式初始化
+    char parent_comm[TASK_COMM_LEN] = {0};
     
     get_task_comm(parent_comm, parent);
 
-    // 检测Docker守护进程
     if (strncmp(parent_comm, "dockerd", TASK_COMM_LEN) == 0 ||
         strncmp(parent_comm, "containerd", TASK_COMM_LEN) == 0) {
         
-        // 获取容器ID（需根据实际环境调整）
-        char *env_ptr = (char *)current->mm->env_start;
-        while (env_ptr < (char *)current->mm->env_end) {
-            if (strncmp(env_ptr, "CONTAINER_ID=", 13) == 0) {
-                strncpy(event.container_id, env_ptr+13, 63);
-                break;
-            }
-            env_ptr += strlen(env_ptr) + 1;
+        // 使用安全方法获取容器ID
+        if (safe_get_container_id(event.container_id, sizeof(event.container_id))) {
+            strscpy(event.container_id, "unknown", sizeof(event.container_id));
         }
 
-        // 记录事件类型
-        strncpy(event.event_type, "container_start", 19);
-        strncpy(event.parent_comm, parent_comm, TASK_COMM_LEN-1);
+        strscpy(event.event_type, "container_start", sizeof(event.event_type));
+        strscpy(event.parent_comm, parent_comm, sizeof(event.parent_comm));
         
-        // 计算镜像哈希（示例路径）
         char image_path[256];
-        snprintf(image_path, 255, "/var/lib/docker/containers/%s/config.v2.json", event.container_id);
+        snprintf(image_path, sizeof(image_path), 
+                "/var/lib/docker/containers/%s/config.v2.json", 
+                event.container_id);
+        
         calculate_hash(image_path, event.image_hash);
         
-        // 输出到内核日志
-        printk(KERN_INFO "[Container Monitor] Event: %s | Container: %s | Image Hash: %s\n",
+        printk(KERN_INFO "[Container Monitor] Event: %s | Container: %s | Image Hash: %64phN\n",
                event.event_type, event.container_id, event.image_hash);
     }
     return 0;
 }
 
-static int __init monitor_init(void) {
+static int __init monitor_init(void) 
+{
+    // 使用正确的系统调用符号（根据内核版本调整）
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,11,0)
+    docker_kp.symbol_name = "__x64_sys_execve";
+#else
+    docker_kp.symbol_name = "sys_execve";
+#endif
+
     docker_kp.pre_handler = handler_pre;
-    docker_kp.symbol_name = "copy_process";
     
-    if (register_kprobe(&docker_kp)) {
-        printk(KERN_ERR "Failed to register kprobe\n");
-        return -1;
+    int ret = register_kprobe(&docker_kp);
+    if (ret) {
+        printk(KERN_ERR "Failed to register kprobe: %d\n", ret);
+        return ret;
     }
     printk(KERN_INFO "Container Monitor loaded\n");
     return 0;
 }
 
-static void __exit monitor_exit(void) {
+static void __exit monitor_exit(void) 
+{
     unregister_kprobe(&docker_kp);
     printk(KERN_INFO "Container Monitor unloaded\n");
 }
